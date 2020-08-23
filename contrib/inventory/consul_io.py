@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 #
 # (c) 2015, Steve Gargan <steve.gargan@gmail.com>
@@ -29,6 +29,7 @@ group nodes by:
  - datacenter,
  - registered service
  - service tags
+ - node metadata (tags)
  - service status
  - values from the k/v store
 
@@ -57,6 +58,29 @@ the URL of the Consul cluster. host, port and scheme are derived from the
 URL. If not specified, connection configuration defaults to http requests
 to localhost on port 8500.
 This can also be set with the environmental variable CONSUL_URL
+
+'service_id':
+
+if true (default) unique service ID will be used as group name (+'servers_suffix' if specified),
+if false service name will be used instead (preferable).
+The service ID is set to the name if not provided.
+
+'cache':
+
+if true inventory caching will be enabled and
+inventory will be stored in 'cache_file'.
+
+'cache_file':
+
+absolute path to inventory cache file.
+Default: /tmp/<script_name>-inventory.json e.g /tmp/consul_io-inventory.json
+
+'cache_ttl':
+
+how long cache will be valid in seconds. Default: 0
+Other supported units are: m = minutes, h = hours, d = days, w = weeks, M = months and Y = years
+e.g cache_ttl=1440m or cache_ttl=24h or cache_ttl=1d and so on.
+Cache will be refreshed when ttl expires or if --refresh arg is used.
 
 'domain':
 
@@ -134,6 +158,7 @@ be used to access the machine.
 import os
 import re
 import argparse
+import datetime
 import sys
 
 from ansible.module_utils.six.moves import configparser
@@ -222,6 +247,18 @@ class ConsulInventory(object):
 
         self.consul_api = config.get_consul_api()
 
+        cache = True if config.cache == 'true' else False
+        cache_ttl = self.convert_to_secs(config.cache_ttl)
+        cache_file = '/tmp/{}-inventory.json'.format(os.path.splitext(os.path.basename(__file__))[0]) if not config.has_config('cache_file') else config.cache_file
+        cache_refresh = config.cli_args.cache_refresh
+        host = config.cli_args.host
+
+        if cache and os.path.isfile(cache_file) and not self.stale_cache(cache_file, cache_ttl) and not cache_refresh and not host:
+            d = self.readfile(cache_file)
+            if d:
+                print(json.dumps(d, indent=2, sort_keys=True))
+                return
+
         if config.has_config('datacenter'):
             if config.has_config('host'):
                 self.load_data_for_node(config.host, config.datacenter)
@@ -231,7 +268,61 @@ class ConsulInventory(object):
             self.load_all_data_consul()
 
         self.combine_all_results()
-        print(json.dumps(self.inventory, sort_keys=True, indent=2))
+        if (cache or cache_refresh) and not host:
+            self.writefile(cache_file, self.inventory)
+        print(json.dumps(self.inventory, indent=2, sort_keys=True))
+
+    def writefile(self, filename, data):
+        ''' Write JSON object to file '''
+        try:
+            with open(filename, 'w') as f:
+                f.write(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+                f.write('\n')
+        except:
+            pass
+
+    def readfile(self, filename):
+        ''' Read JSON from file and return dictionary (output: dict) '''
+        try:
+            with open(filename, 'r') as f:
+                return json.load(f)
+        except:
+            return {}
+
+    def stale_cache(self, filename, retention_time):
+        ''' Check cache freshness (output: boolean) '''
+        now = int(datetime.datetime.strftime(datetime.datetime.now(), '%s'))
+        mtime = int(os.path.getmtime(filename))
+
+        if (now - mtime) > retention_time:
+            return True
+        else:
+            return False
+
+    def convert_to_secs(self, human_time):
+        ''' Convert human time format to seconds (output: int) '''
+        try:
+            supported = {
+                's': 1,
+                'm': 60,
+                'h': 60*60,
+                'd': 24*60*60,
+                'w': 7*24*60*60,
+                'M': 30*24*60*60,
+                'Y': 365*24*60*60
+            }
+
+            num = human_time[:-1]
+            suffix = human_time[-1]
+
+            if suffix in supported:
+                secs = int(num) * supported[suffix]
+            else:
+                secs = int(human_time)
+        except:
+            secs = int()
+
+        return secs
 
     def bulk_load(self, datacenter):
         index, groups_list = self.consul_api.kv.get(self.config.kv_groups, recurse=True, dc=datacenter)
@@ -278,12 +369,12 @@ class ConsulInventory(object):
         return consul_ok and service_ok
 
     def consul_get_kv_inmemory(self, key):
-        result = filter(lambda x: x['Key'] == key, self.inmemory_kv)
-        return result.pop() if result else None
+        result = list(filter(lambda x: x['Key'] == key, self.inmemory_kv))
+        return result.pop() if result else {}
 
     def consul_get_node_inmemory(self, node):
-        result = filter(lambda x: x['Node'] == node, self.inmemory_nodes)
-        return {"Node": result.pop(), "Services": {}} if result else None
+        result = list(filter(lambda x: x['Node'] == node, self.inmemory_nodes))
+        return {'Node': result.pop(), 'Services': {}} if result else {}
 
     def load_data_for_datacenter(self, datacenter):
         '''processes all the nodes in a particular datacenter'''
@@ -305,9 +396,14 @@ class ConsulInventory(object):
             node_data = self.consul_get_node_inmemory(node)
         node = node_data['Node']
 
+        for k, v in node_data['Node']['Meta'].items():
+            if v:
+                self.add_node_to_map(self.nodes, '{}_{}'.format(k, v), node)
+
         self.add_node_to_map(self.nodes, 'all', node)
-        self.add_metadata(node_data, "consul_datacenter", datacenter)
-        self.add_metadata(node_data, "consul_nodename", node['Node'])
+        self.add_metadata(node_data, 'consul_datacenter', datacenter)
+        self.add_metadata(node_data, 'consul_nodename', node['Node'])
+        self.add_metadata(node_data, 'consul_node_metadata', node['Meta'])
 
         self.load_groups_from_kv(node_data)
         self.load_node_metadata_from_kv(node_data)
@@ -322,7 +418,7 @@ class ConsulInventory(object):
             metadata '''
         node = node_data['Node']
         if self.config.has_config('kv_metadata'):
-            key = "%s/%s/%s" % (self.config.kv_metadata, self.current_dc, node['Node'])
+            key = '{}/{}/{}'.format(self.config.kv_metadata, self.current_dc, node['Node'])
             if self.config.bulk_load == 'true':
                 metadata = self.consul_get_kv_inmemory(key)
             else:
@@ -341,7 +437,7 @@ class ConsulInventory(object):
             group found '''
         node = node_data['Node']
         if self.config.has_config('kv_groups'):
-            key = "%s/%s/%s" % (self.config.kv_groups, self.current_dc, node['Node'])
+            key = '{}/{}/{}'.format(self.config.kv_groups, self.current_dc, node['Node'])
             if self.config.bulk_load == 'true':
                 groups = self.consul_get_kv_inmemory(key)
             else:
@@ -354,10 +450,13 @@ class ConsulInventory(object):
         '''process a service registered on a node, adding the node to a group with
         the service name. Each service tag is extracted and the node is added to a
         tag grouping also'''
-        self.add_metadata(node_data, "consul_services", service_name, True)
+        if self.config.service_id == 'false':
+            service_name = service['Service']
 
-        if self.is_service("ssh", service_name):
-            self.add_metadata(node_data, "ansible_ssh_port", service['Port'])
+        self.add_metadata(node_data, 'consul_services', service_name, True)
+
+        if self.is_service('ssh', service_name):
+            self.add_metadata(node_data, 'ansible_ssh_port', service['Port'])
 
         if self.config.has_config('servers_suffix'):
             service_name = service_name + self.config.servers_suffix
@@ -371,16 +470,20 @@ class ConsulInventory(object):
     def extract_groups_from_tags(self, service_name, service, node_data):
         '''iterates each service tag and adds the node to groups derived from the
         service and tag names e.g. nginx_master'''
-        if self.config.has_config('tags') and service['Tags']:
+        if self.config.tags == 'true' and service['Tags']:
             tags = service['Tags']
-            self.add_metadata(node_data, "consul_%s_tags" % service_name, tags)
-            for tag in service['Tags']:
+            for tag in tags:
+                if '=' in tag:
+                    k, v = tag.split('=')
+                    self.add_metadata(node_data, 'consul_{}_tag_{}'.format(service_name, k), v)
+            self.add_metadata(node_data, 'consul_{}_tags'.format(service_name), tags)
+            for tag in tags:
                 tagname = service_name + '_' + tag
                 self.add_node_to_map(self.nodes_by_tag, tagname, node_data['Node'])
 
     def combine_all_results(self):
         '''prunes and sorts all groupings for combination into the final map'''
-        self.inventory = {"_meta": {"hostvars": self.node_metadata}}
+        self.inventory = {'_meta': {'hostvars': self.node_metadata}}
         groupings = [self.nodes, self.nodes_by_datacenter, self.nodes_by_service,
                      self.nodes_by_tag, self.nodes_by_kv, self.nodes_by_availability]
         for grouping in groupings:
@@ -409,9 +512,9 @@ class ConsulInventory(object):
         if domain:
             node_name = node_data['Node']
             if self.current_dc:
-                return '%s.node.%s.%s' % (node_name, self.current_dc, domain)
+                return '{}.node.{}.{}'.format(node_name, self.current_dc, domain)
             else:
-                return '%s.node.%s' % (node_name, domain)
+                return '{}.node.{}'.format(node_name, domain)
         else:
             return node_data['Address']
 
@@ -430,7 +533,7 @@ class ConsulInventory(object):
     def to_safe(self, word):
         ''' Converts 'bad' characters in a string to underscores so they can be used
          as Ansible groups '''
-        return re.sub(r'[^A-Za-z0-9\-\.]', '_', word)
+        return re.sub(r'[^A-Za-z0-9\.]', '_', word)
 
     def sanitize_dict(self, d):
 
@@ -462,7 +565,7 @@ class ConsulConfig(dict):
 
     def read_settings(self):
         ''' Reads the settings from the consul_io.ini file (or consul.ini for backwards compatibility)'''
-        config = configparser.SafeConfigParser()
+        config = configparser.ConfigParser()
         if os.path.isfile(os.path.dirname(os.path.realpath(__file__)) + '/consul_io.ini'):
             config.read(os.path.dirname(os.path.realpath(__file__)) + '/consul_io.ini')
         else:
@@ -471,7 +574,8 @@ class ConsulConfig(dict):
         config_options = ['host', 'token', 'datacenter', 'servers_suffix',
                           'tags', 'kv_metadata', 'kv_groups', 'availability',
                           'unavailable_suffix', 'available_suffix', 'url',
-                          'domain', 'suffixes', 'bulk_load']
+                          'domain', 'suffixes', 'bulk_load', 'service_id',
+                          'cache', 'cache_ttl', 'cache_file']
         for option in config_options:
             value = None
             if config.has_option('consul', option):
@@ -480,18 +584,21 @@ class ConsulConfig(dict):
 
     def read_cli_args(self):
         ''' Command line argument processing '''
-        parser = argparse.ArgumentParser(description='Produce an Ansible Inventory file based nodes in a Consul cluster')
+        parser = argparse.ArgumentParser(description='Produce an Ansible Inventory file based nodes in a Consul cluster.')
 
         parser.add_argument('--list', action='store_true',
-                            help='Get all inventory variables from all nodes in the consul cluster')
+                            help='Get all inventory variables from all nodes in the consul cluster.')
         parser.add_argument('--host', action='store',
-                            help='Get all inventory variables about a specific consul node,'
+                            help='Get all inventory variables about a specific consul node, '
                                  'requires datacenter set in consul.ini.')
+        parser.add_argument('--refresh', action='store_true', dest='cache_refresh',
+                            help='Refresh inventory cache.')
         parser.add_argument('--datacenter', action='store',
-                            help='Get all inventory about a specific consul datacenter')
+                            help='Get all inventory about a specific consul datacenter.')
 
         args = parser.parse_args()
-        arg_names = ['host', 'datacenter']
+        self.cli_args = args
+        arg_names = ['host', 'datacenter', 'cache_refresh']
 
         for arg in arg_names:
             if getattr(args, arg):
